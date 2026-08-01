@@ -355,6 +355,52 @@ class TestConfig:
         assert captured["llm_provider"] == "openai"
 
 
+class TestLocalEmbeddedDisabled:
+    """Regression tests for issue #74578 — provider silently disabled when
+    local runtime import fails, but Dashboard still shows 'active'.
+    """
+
+    def test_disabled_mode_logs_error_with_guidance(self, tmp_path, monkeypatch, caplog):
+        """When local_embedded runtime import fails, an ERROR-level log with
+        actionable guidance must be emitted (not just a WARNING)."""
+        import logging
+
+        config = {
+            "mode": "local_embedded",
+            "bank_id": "test-bank",
+            "budget": "mid",
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime",
+            lambda: (False, "No module named 'hindsight_embed'"),
+        )
+
+        with caplog.at_level(logging.ERROR, logger="plugins.memory.hindsight"):
+            provider = HindsightMemoryProvider()
+            provider.initialize(
+                session_id="test-session",
+                hermes_home=str(tmp_path),
+                platform="cli",
+            )
+
+        assert provider._mode == "disabled"
+        # The error log must mention the issue number and give install guidance
+        error_msgs = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("74578" in msg for msg in error_msgs), (
+            "Expected error log to reference issue #74578 for diagnosability"
+        )
+        assert any("hindsight-all" in msg for msg in error_msgs), (
+            "Expected error log to include install guidance for hindsight-all"
+        )
+
+
 class TestPostSetup:
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"

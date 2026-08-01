@@ -1324,8 +1324,14 @@ class HindsightMemoryProvider(MemoryProvider):
             _export_port_health_grace_timeout(self._config)
             available, reason = _check_local_runtime()
             if not available:
-                logger.warning(
-                    "Hindsight local mode disabled because its runtime could not be imported: %s",
+                logger.error(
+                    "Hindsight memory provider initialized in local_embedded mode "
+                    "but its runtime could not be imported: %s. The provider will "
+                    "not register any tools. Ensure hindsight-all is installed in "
+                    "the same Python environment as Hermes (run: uv pip install "
+                    "--python <hermes-venv> hindsight-all). The Dashboard may still "
+                    "show the provider as 'active' because it reads config, not "
+                    "runtime availability (issue #74578).",
                     reason,
                 )
                 self._mode = "disabled"
