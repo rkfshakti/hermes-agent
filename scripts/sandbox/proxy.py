@@ -19,6 +19,7 @@ Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 
 import os
 import pathlib
+import selectors
 import socket
 import ssl
 import subprocess
@@ -150,6 +151,39 @@ def relay(source, destination):
         destination.sendall(chunk)
 
 
+def tunnel_connect(conn, host, port):
+    """Relay a CONNECT stream unchanged when the host has no fixtures.
+
+    npm opens many concurrent, persistent HTTPS connections. Intercepting those
+    connections needlessly terminates TLS in this proxy and creates a fresh
+    upstream TLS session for every request, which can exhaust or race the npm
+    registry/CDN and surface as repeated ``SSLEOFError`` handshakes. Hosts with
+    no fixture content do not need interception, so preserve their native TLS
+    connection end to end.
+    """
+    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as upstream:
+        upstream.settimeout(None)
+        conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+        with selectors.DefaultSelector() as ready:
+            ready.register(conn, selectors.EVENT_READ, 'client')
+            ready.register(upstream, selectors.EVENT_READ, 'upstream')
+            while True:
+                for key, _ in ready.select():
+                    source = key.fileobj
+                    destination = upstream if key.data == 'client' else conn
+                    chunk = source.recv(MAX_REQUEST_BYTES)
+                    if chunk:
+                        destination.sendall(chunk)
+                        continue
+                    if key.data == 'upstream':
+                        return
+                    ready.unregister(conn)
+                    try:
+                        upstream.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        return
+
+
 def forward_https(conn, host, port, request):
     context = ssl.create_default_context(cafile=str(REAL_CA))
     with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
@@ -169,9 +203,12 @@ def forward_http(conn, host, port, request, target):
 
 
 def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
+    """Intercept fixture hosts; tunnel every other CONNECT unchanged."""
     host, _, port_text = target.rpartition(':')
     port = int(port_text or '443')
+    if not (ROOT / host).is_dir():
+        tunnel_connect(conn, host, port)
+        return
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
