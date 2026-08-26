@@ -32,6 +32,29 @@ def load_proxy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return module
 
 
+def test_prepare_client_ca_bundle_trusts_sandbox_and_public_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxy = load_proxy(tmp_path, monkeypatch)
+    sandbox_ca = (
+        b"-----BEGIN CERTIFICATE-----\nsandbox\n-----END CERTIFICATE-----\n"
+    )
+    stale_public_ca = (
+        b"-----BEGIN CERTIFICATE-----\nstale\n-----END CERTIFICATE-----\n"
+    )
+    public_cas = b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n"
+    client_bundle = proxy.CERTS / "ca.pem"
+    client_bundle.write_bytes(sandbox_ca + stale_public_ca)
+    proxy.REAL_CA.write_bytes(public_cas)
+
+    proxy.prepare_client_ca_bundle()
+    first = client_bundle.read_bytes()
+    proxy.prepare_client_ca_bundle()
+
+    assert first == sandbox_ca + public_cas
+    assert client_bundle.read_bytes() == first
+
+
 def test_connect_without_fixture_uses_raw_tunnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

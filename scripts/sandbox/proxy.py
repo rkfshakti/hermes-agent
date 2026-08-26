@@ -11,8 +11,9 @@ forwards to the real host:
   sandbox is isolated from the *host*, not from the internet: a real install
   still has to reach PyPI and npm.
 
-HTTPS is intercepted by minting a per-host certificate from the sandbox's own
-throwaway CA, which the payload trusts via CURL_CA_BUNDLE / SSL_CERT_FILE.
+HTTPS fixture hosts are intercepted with certificates from the sandbox's
+throwaway CA. Other CONNECT streams remain end-to-end TLS, so the payload's CA
+bundle combines the throwaway CA with the host's real public roots.
 
 Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 """
@@ -33,6 +34,29 @@ LISTEN_ADDRESS = ('127.0.0.1', 8080)
 MAX_REQUEST_BYTES = 65536
 UPSTREAM_TIMEOUT_SECONDS = 30
 CERT_VALIDITY_DAYS = 2
+PEM_CERT_END = b'-----END CERTIFICATE-----'
+
+
+def prepare_client_ca_bundle():
+    """Trust both fixture certificates and real TLS used by raw tunnels.
+
+    ``ca.pem`` starts with the sandbox's one throwaway CA. Preserve only that
+    first certificate, then append the current host CA bundle. Rebuilding from
+    the first certificate keeps persistent sandbox restarts idempotent and
+    avoids retaining stale copies of the public roots.
+    """
+    client_ca = CERTS / 'ca.pem'
+    existing = client_ca.read_bytes()
+    certificate_end = existing.find(PEM_CERT_END)
+    if certificate_end < 0:
+        raise RuntimeError(f'sandbox CA is not a PEM certificate: {client_ca}')
+    sandbox_ca = existing[:certificate_end + len(PEM_CERT_END)].rstrip() + b'\n'
+    combined = sandbox_ca + REAL_CA.read_bytes().lstrip()
+    if existing == combined:
+        return
+    temporary = CERTS / f'ca.pem.{os.getpid()}.tmp'
+    temporary.write_bytes(combined)
+    os.replace(temporary, client_ca)
 
 
 def read_request(conn):
@@ -261,6 +285,7 @@ def handle(conn):
 
 
 def main():
+    prepare_client_ca_bundle()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(LISTEN_ADDRESS)
