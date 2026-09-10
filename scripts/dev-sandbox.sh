@@ -220,6 +220,50 @@ fi
 mkdir -p "$SANDBOX_ROOT"/{root,home,etc}
 UPSTREAM_REPO=""
 UPSTREAM_COMMIT=""
+# Where the upstream fetch logs its stderr. CI points HERMES_E2E_LOG_DIR at the
+# artifact upload directory; unset means a local run, where stderr on the
+# terminal is already visible and a log file would just rot in /tmp.
+FETCH_LOG="${HERMES_E2E_LOG_DIR:-}"
+if [ -n "$FETCH_LOG" ]; then
+  mkdir -p "$FETCH_LOG"
+  FETCH_LOG="$FETCH_LOG/sandbox-upstream-fetch.log"
+  : > "$FETCH_LOG"
+fi
+
+# Fetch REF from UPSTREAM_URL with retries. Runner egress IPs get transient
+# GitHub 429s (and the odd TLS EOF); a bare `2>/dev/null` fetch turned one into
+# an opaque "could not resolve upstream ref" that cost a whole scheduled run.
+# Retries with backoff absorb it; the log keeps the real error when they don't.
+fetch_upstream() {
+  local ref="$1"
+  local attempt=1
+  local max_attempts=3
+  local delay=10
+  local status
+  while :; do
+    if [ -n "$FETCH_LOG" ]; then
+      if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$ref" 2>>"$FETCH_LOG"; then
+        return 0
+      else
+        status=$?
+      fi
+    else
+      if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$ref" 2>/dev/null; then
+        return 0
+      else
+        status=$?
+      fi
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      return "$status"
+    fi
+    echo "[sandbox] upstream fetch of $ref failed (exit $status, attempt $attempt/$max_attempts); retrying in ${delay}s" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+}
+
 if [ -n "$INSTALL_REF" ]; then
   echo "[sandbox] fetching upstream $INSTALL_REF for installer/update test" >&2
   UPSTREAM_REPO="$(mktemp -d -t hermes-sandbox-upstream.XXXXXX)"
@@ -232,12 +276,18 @@ if [ -n "$INSTALL_REF" ]; then
   # Peel to ^{commit} in both cases: an annotated tag fetches as a tag OBJECT,
   # and using it directly fails later with "trying to write non-commit object
   # ... to branch 'refs/heads/main'".
-  if git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" "$INSTALL_REF" 2>/dev/null; then
-    UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse "FETCH_HEAD^{commit}")"
-  elif git -C "$UPSTREAM_REPO" fetch -q "$UPSTREAM_URL" refs/heads/main \
+  if fetch_upstream "$INSTALL_REF" \
+    && UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse "FETCH_HEAD^{commit}")"; then
+    :
+  elif fetch_upstream refs/heads/main \
     && UPSTREAM_COMMIT="$(git -C "$UPSTREAM_REPO" rev-parse --verify -q "$INSTALL_REF^{commit}")"; then
     :
   else
+    if [ -n "$FETCH_LOG" ] && [ -s "$FETCH_LOG" ]; then
+      echo "--- sandbox upstream fetch log ---" >&2
+      cat "$FETCH_LOG" >&2
+      echo '--- end sandbox upstream fetch log ---' >&2
+    fi
     rm -rf -- "$UPSTREAM_REPO"
     echo "error: could not resolve upstream ref: $INSTALL_REF" >&2
     echo '       Use a branch (main), a tag (v2026.7.7), or a SHA reachable from main.' >&2
